@@ -5,7 +5,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::patch::PATCHED_EXE_NAME;
 
 pub const CONFIG_NAME: &str = "Azangara.cfg";
 
@@ -41,7 +40,7 @@ impl Install {
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
             let name = file_name_lower(&path);
-            if !name.ends_with(".exe") || name == PATCHED_EXE_NAME.to_ascii_lowercase() {
+            if !name.ends_with(".exe") {
                 continue;
             }
             let Some(machine) = pe_machine(&path) else { continue };

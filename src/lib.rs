@@ -14,14 +14,19 @@
 //!   `designer` is non-zero and `dev_level` names a level file, in which case it
 //!   starts that level directly. That is how a level is opened at launch.
 //! - The Direct3D config dialog is shown unconditionally by one function
-//!   returning "user pressed Play"; [`patch`] writes a copy of the executable in
-//!   which that function immediately returns true.
+//!   returning "user pressed Play". [`patch`] locates it and [`inject`] starts
+//!   the game suspended and makes it return true in memory; no file changes.
+//! - `*.pak` archives are loaded from the working directory, so [`overlay`]
+//!   adds extra paks by running the game from a temporary directory of
+//!   symlinks instead of copying anything into the game folder.
 
 pub mod config;
 pub mod display;
+pub mod inject;
 pub mod install;
 pub mod launch;
 pub mod levels;
+pub mod overlay;
 pub mod pak;
 pub mod patch;
 

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use azangara::{levels, patch, DisplaySettings, Install, LaunchOptions, Runner};
+use azangara::{levels, DisplaySettings, Install, LaunchOptions, Runner};
 
 /// Configure and launch Azangara (Direct3D 1.x builds and the OpenGL port).
 #[derive(Parser)]
@@ -24,7 +24,12 @@ enum Cmd {
     /// Show engine, files and current display settings of an installation.
     Info { game: String },
     /// List the levels that can be opened at launch.
-    Levels { game: String },
+    Levels {
+        game: String,
+        /// Also list the levels inside these extra .pak files, repeatable.
+        #[arg(long = "pak", value_name = "FILE")]
+        paks: Vec<PathBuf>,
+    },
     /// Show or change display settings (no flags: show).
     Display {
         game: String,
@@ -37,8 +42,13 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
-    /// Write the dialog-free executable without launching (Direct3D builds).
-    Patch { game: String },
+    /// Check that the config dialog can be skipped: start the game suspended,
+    /// verify the in-memory patch, then terminate it before it runs (Direct3D builds).
+    Verify {
+        game: String,
+        #[command(flatten)]
+        runner: RunnerArgs,
+    },
     /// Start the game, skipping the config dialog.
     Launch(LaunchArgs),
 }
@@ -59,9 +69,14 @@ enum ConfigAction {
 struct LaunchArgs {
     /// Installation folder, or the name (or unique part of the name) of a folder under the root.
     game: String,
-    /// Level to open after the intro: `level_1`, `level_1.txt` or `levels/level_1.txt`.
+    /// Level to open after the intro: `level_1`, `levels/level_1.txt`, the path
+    /// of a level inside an extra pak (`assets/lebel/lebel.txt`) or its file
+    /// name (`lebel`), or a .pak file holding a single level (implies --pak).
     #[arg(short, long)]
     level: Option<String>,
+    /// Extra .pak file to load without copying it into the game folder, repeatable.
+    #[arg(long = "pak", value_name = "FILE")]
+    paks: Vec<PathBuf>,
     #[command(flatten)]
     display: DisplayArgs,
     /// Extra config variable, repeatable: `--set nolife=1`.
@@ -70,6 +85,19 @@ struct LaunchArgs {
     /// Show the Direct3D config dialog instead of skipping it.
     #[arg(long)]
     show_dialog: bool,
+    #[command(flatten)]
+    runner: RunnerArgs,
+    /// Return immediately instead of waiting for the game to exit.
+    /// (Level auto-start then stays enabled in the config until the next launch.)
+    #[arg(long)]
+    no_wait: bool,
+    /// Print what would be done without writing anything or starting the game.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct RunnerArgs {
     /// Program used to run the .exe [default: native on Windows, $WINE or `wine` elsewhere].
     #[arg(long, conflicts_with = "native")]
     runner: Option<OsString>,
@@ -79,13 +107,19 @@ struct LaunchArgs {
     /// Run the executable directly, without wine.
     #[arg(long)]
     native: bool,
-    /// Return immediately instead of waiting for the game to exit.
-    /// (Level auto-start then stays enabled in the config until the next launch.)
-    #[arg(long)]
-    no_wait: bool,
-    /// Print what would be done without writing anything or starting the game.
-    #[arg(long)]
-    dry_run: bool,
+}
+
+impl RunnerArgs {
+    fn runner(self) -> Runner {
+        match (self.native, self.runner) {
+            (true, _) => Runner::Native,
+            (false, Some(program)) => Runner::Wrapper { program, args: self.runner_args },
+            (false, None) => match Runner::default() {
+                Runner::Wrapper { program, .. } => Runner::Wrapper { program, args: self.runner_args },
+                native => native,
+            },
+        }
+    }
 }
 
 #[derive(Args, Default)]
@@ -207,11 +241,11 @@ fn main() -> Result<()> {
                 if auto && !level.is_empty() { level } else { "off".into() }
             );
         }
-        Cmd::Levels { game } => {
+        Cmd::Levels { game, paks } => {
             let install = find_install(&root, &game)?;
-            for l in levels::list(&install) {
+            for l in levels::list(&install, &paks) {
                 println!(
-                    "{:<20} {:<26} {}",
+                    "{:<24} {:<26} {}",
                     l.short_name(),
                     l.title.as_deref().unwrap_or("-"),
                     l.source.as_deref().unwrap_or("(loose file)")
@@ -251,10 +285,23 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Patch { game } => {
+        Cmd::Verify { game, runner } => {
             let install = find_install(&root, &game)?;
-            let exe = patch::skip_dialog_exe(&install)?;
-            println!("{}", exe.display());
+            let opts = LaunchOptions { runner: runner.runner(), ..Default::default() };
+            let plan = azangara::launch::plan(&install, &opts)?;
+            let [patch] = &plan.patches[..] else {
+                println!("{}: no config dialog to skip", install.name());
+                return Ok(());
+            };
+            println!("{}: patch at RVA {:#x}: {}", install.name(), patch.rva, patch.spec());
+            let status = plan
+                .command(install.dir.clone())?
+                .env("AZL_INJECT_DRY_RUN", "1")
+                .status()
+                .context("running azl-inject")?;
+            if !status.success() {
+                bail!("in-memory patch could not be verified ({status})");
+            }
         }
         Cmd::Launch(args) => launch(&root, args)?,
     }
@@ -263,21 +310,31 @@ fn main() -> Result<()> {
 
 fn launch(root: &Path, args: LaunchArgs) -> Result<()> {
     let install = find_install(root, &args.game)?;
-    let level = args.level.as_deref().map(|l| levels::resolve(&install, l));
-    let runner = match (args.native, args.runner) {
-        (true, _) => Runner::Native,
-        (false, Some(program)) => Runner::Wrapper { program, args: args.runner_args },
-        (false, None) => match Runner::default() {
-            Runner::Wrapper { program, .. } => Runner::Wrapper { program, args: args.runner_args },
-            native => native,
-        },
+    let mut paks = args.paks;
+    let level = match args.level {
+        Some(l) if l.to_ascii_lowercase().ends_with(".pak") => {
+            let pak = PathBuf::from(&l);
+            let found = levels::pak_levels(&pak);
+            let [level] = &found[..] else {
+                bail!(
+                    "{l} holds {} levels, pick one with --pak {l} --level <name>: {}",
+                    found.len(),
+                    found.iter().map(|l| l.path.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            };
+            paks.push(pak);
+            Some(level.path.clone())
+        }
+        Some(l) => Some(levels::resolve(&install, &paks, &l)),
+        None => None,
     };
     let opts = LaunchOptions {
         level,
         display: args.display.settings(),
         vars: args.vars,
+        extra_paks: paks,
         show_dialog: args.show_dialog,
-        runner,
+        runner: args.runner.runner(),
         wait: !args.no_wait,
     };
     let plan = azangara::launch::plan(&install, &opts)?;
@@ -286,7 +343,18 @@ fn launch(root: &Path, args: LaunchArgs) -> Result<()> {
     for (k, v) in &plan.vars {
         println!("  set {k} \"{v}\"");
     }
-    println!("  run {:?}", plan.command());
+    for p in &plan.patches {
+        println!("  patch in memory at RVA {:#x}: {}", p.rva, p.spec());
+    }
+    let cwd = if plan.extra_paks.is_empty() {
+        install.dir.clone()
+    } else {
+        for pak in &plan.extra_paks {
+            println!("  add pak {}", pak.display());
+        }
+        std::env::temp_dir().join("azl-overlay-<pid>")
+    };
+    println!("  run {:?}", plan.command(cwd)?);
     if args.dry_run {
         return Ok(());
     }

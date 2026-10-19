@@ -1,0 +1,19 @@
+[package]
+name = "azl-inject"
+version = "0.1.0"
+edition = "2024"
+description = "Starts a 32-bit Windows program suspended, patches its memory, then resumes it"
+publish = false
+
+# Built by ../build.rs for i686-pc-windows-gnu and embedded into `azl`.
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+panic = "abort"
