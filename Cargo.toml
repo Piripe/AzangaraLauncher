@@ -1,0 +1,17 @@
+[package]
+name = "azangara-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Toolkit to configure and launch every Azangara build (Direct3D 1.x and OpenGL)"
+
+[lib]
+name = "azangara"
+path = "src/lib.rs"
+
+[[bin]]
+name = "azl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
