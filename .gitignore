@@ -1,4 +1,6 @@
 /target
-/AzangaraVersions
-/azl
+/versions
 /levels
+/compat
+/azl
+/launcher.json

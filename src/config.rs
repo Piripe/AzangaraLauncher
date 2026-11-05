@@ -108,6 +108,24 @@ impl Config {
             .map(|l| latin1(l))
     }
 
+    /// `keycmd <key> <command...>` lines as (key, command) pairs, in file order.
+    pub fn keycmds(&self) -> Vec<(String, String)> {
+        self.key_bindings()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("keycmd ")?.trim();
+                let (key, command) = rest.split_once(char::is_whitespace)?;
+                Some((key.to_string(), command.trim().to_string()))
+            })
+            .collect()
+    }
+
+    /// Replaces every `keycmd` line; they go first, as the game writes them.
+    pub fn set_keycmds(&mut self, binds: &[(String, String)]) {
+        self.lines.retain(|l| !l.starts_with(b"keycmd "));
+        let lines = binds.iter().map(|(k, c)| format!("keycmd {k} {c}").chars().map(|c| c as u8).collect());
+        self.lines.splice(0..0, lines);
+    }
+
     fn var_index(&self, key: &str) -> Option<usize> {
         self.lines
             .iter()
@@ -177,6 +195,15 @@ mod tests {
         cfg.set("cam_depth", "1").unwrap();
         assert_eq!(cfg.get("cam_depth").as_deref(), Some("1"));
         assert!(cfg.to_bytes().starts_with(b"cam_depth \"1\"\r\n"));
+    }
+
+    #[test]
+    fn keycmds_round_trip() {
+        let mut cfg = Config::parse(SAMPLE);
+        assert_eq!(cfg.keycmds(), [("w".to_string(), "cam_depth".to_string())]);
+        cfg.set_keycmds(&[("tab".into(), "m_show IDM_LEVEL_STAT".into()), ("space".into(), "jump".into())]);
+        assert!(cfg.to_bytes().starts_with(b"keycmd tab m_show IDM_LEVEL_STAT\r\nkeycmd space jump\r\nr_width"));
+        assert_eq!(cfg.keycmds().len(), 2);
     }
 
     #[test]

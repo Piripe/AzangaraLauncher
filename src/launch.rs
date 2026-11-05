@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 
 use anyhow::{Context, Result};
 
@@ -46,6 +46,8 @@ pub struct LaunchOptions {
     /// Show the Direct3D configuration dialog instead of skipping it.
     pub show_dialog: bool,
     pub runner: Runner,
+    /// Extra environment variables for the game (e.g. `WINEPREFIX`).
+    pub env: Vec<(OsString, OsString)>,
     /// Wait for the game to exit, then switch level auto-start back off so a
     /// plain start of the game goes to the main menu again, and remove the
     /// temporary overlay directory.
@@ -62,6 +64,7 @@ pub struct LaunchPlan {
     pub patches: Vec<MemoryPatch>,
     pub extra_paks: Vec<PathBuf>,
     pub runner: Runner,
+    pub env: Vec<(OsString, OsString)>,
     pub wait: bool,
     restore_designer: bool,
 }
@@ -98,6 +101,7 @@ pub fn plan(install: &Install, opts: &LaunchOptions) -> Result<LaunchPlan> {
         patches,
         extra_paks: opts.extra_paks.clone(),
         runner: opts.runner.clone(),
+        env: opts.env.clone(),
         wait: opts.wait,
         restore_designer: opts.level.is_some(),
     })
@@ -135,12 +139,30 @@ impl LaunchPlan {
         if !self.patches.is_empty() {
             cmd.arg(game_arg).env(inject::PATCH_ENV, inject::patch_env(&self.patches));
         }
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
         cmd.current_dir(cwd);
+        #[cfg(windows)]
+        {
+            // The helper is a console program; don't flash a console window.
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         Ok(cmd)
     }
 
     /// Writes the config, then starts the game. Returns the exit status when waiting.
     pub fn execute(&self) -> Result<Option<ExitStatus>> {
+        let game = self.spawn()?;
+        if !self.wait {
+            game.detach();
+            return Ok(None);
+        }
+        game.wait().map(Some)
+    }
+
+    /// Writes the config and starts the game without waiting for it.
+    pub fn spawn(&self) -> Result<RunningGame> {
         let install = &self.install;
         let mut cfg = install.load_config().context("reading config")?;
         for (k, v) in &self.vars {
@@ -148,38 +170,66 @@ impl LaunchPlan {
         }
         install.save_config(&cfg).context("writing config")?;
 
-        let overlay = if self.extra_paks.is_empty() {
+        // The OpenGL port only reads loose textures; see `overlay`.
+        let merge_textures = install.engine == Engine::OpenGL;
+        let overlay = if self.extra_paks.is_empty() && !merge_textures {
             None
         } else {
-            Some(Overlay::create(&install.dir, &self.extra_paks).context("creating overlay directory")?)
+            Some(Overlay::create(&install.dir, &self.extra_paks, merge_textures).context("creating overlay directory")?)
         };
         let cwd = overlay.as_ref().map_or_else(|| install.dir.clone(), |o| o.dir().to_owned());
 
-        let spawned = self.command(cwd)?.spawn().context("starting the game");
-        let mut child = match spawned {
-            Ok(child) => child,
+        let spawned = self.command(cwd).and_then(|mut c| c.spawn().context("starting the game"));
+        match spawned {
+            Ok(child) => Ok(RunningGame {
+                child,
+                overlay,
+                install: install.clone(),
+                restore_designer: self.restore_designer,
+            }),
             Err(e) => {
                 if let Some(o) = overlay {
                     let _ = o.close();
                 }
-                return Err(e);
+                Err(e)
             }
-        };
-        if !self.wait {
-            // The overlay must outlive us; it is left in the temp directory.
-            std::mem::forget(overlay);
-            return Ok(None);
         }
-        let status = child.wait()?;
-        if let Some(o) = overlay {
+    }
+}
+
+/// A started game; [`RunningGame::wait`] cleans up after it.
+#[derive(Debug)]
+pub struct RunningGame {
+    child: Child,
+    overlay: Option<Overlay>,
+    install: Install,
+    restore_designer: bool,
+}
+
+impl RunningGame {
+    /// Process ID of the started program (wine or the helper, not the game itself).
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Waits for the game to exit, removes the overlay and switches level
+    /// auto-start back off so a plain start goes to the main menu again.
+    pub fn wait(mut self) -> Result<ExitStatus> {
+        let status = self.child.wait()?;
+        if let Some(o) = self.overlay.take() {
             o.close().context("removing overlay directory")?;
         }
         if self.restore_designer {
             // The game rewrites its config on exit, so reload before editing.
-            let mut cfg = install.load_config()?;
+            let mut cfg = self.install.load_config()?;
             cfg.set("designer", "0").map_err(anyhow::Error::msg)?;
-            install.save_config(&cfg)?;
+            self.install.save_config(&cfg)?;
         }
-        Ok(Some(status))
+        Ok(status)
+    }
+
+    /// Lets the game run on its own; the overlay, if any, stays in the temp directory.
+    pub fn detach(mut self) {
+        std::mem::forget(self.overlay.take());
     }
 }

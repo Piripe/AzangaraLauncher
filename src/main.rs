@@ -10,7 +10,7 @@ use azangara::{levels, DisplaySettings, Install, LaunchOptions, Runner};
 #[derive(Parser)]
 #[command(name = "azl", version)]
 struct Cli {
-    /// Folder containing the game folders [default: $AZANGARA_ROOT, ./AzangaraVersions or .]
+    /// Folder containing the game folders [default: $AZANGARA_ROOT, ./versions or .]
     #[arg(long, global = true)]
     root: Option<PathBuf>,
     #[command(subcommand)]
@@ -336,6 +336,7 @@ fn launch(root: &Path, args: LaunchArgs) -> Result<()> {
         show_dialog: args.show_dialog,
         runner: args.runner.runner(),
         wait: !args.no_wait,
+        ..Default::default()
     };
     let plan = azangara::launch::plan(&install, &opts)?;
 
@@ -346,12 +347,15 @@ fn launch(root: &Path, args: LaunchArgs) -> Result<()> {
     for p in &plan.patches {
         println!("  patch in memory at RVA {:#x}: {}", p.rva, p.spec());
     }
-    let cwd = if plan.extra_paks.is_empty() {
+    for pak in &plan.extra_paks {
+        println!("  add pak {}", pak.display());
+    }
+    if install.engine == azangara::Engine::OpenGL {
+        println!("  serve the paks' textures as textures/ (the OpenGL port can't read them from paks)");
+    }
+    let cwd = if plan.extra_paks.is_empty() && install.engine != azangara::Engine::OpenGL {
         install.dir.clone()
     } else {
-        for pak in &plan.extra_paks {
-            println!("  add pak {}", pak.display());
-        }
         std::env::temp_dir().join("azl-overlay-<pid>")
     };
     println!("  run {:?}", plan.command(cwd)?);
@@ -395,7 +399,7 @@ fn default_root() -> PathBuf {
     if let Some(root) = std::env::var_os("AZANGARA_ROOT") {
         return root.into();
     }
-    let versions = PathBuf::from("AzangaraVersions");
+    let versions = PathBuf::from("versions");
     if versions.is_dir() {
         versions
     } else {

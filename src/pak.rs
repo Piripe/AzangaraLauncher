@@ -4,7 +4,9 @@
 //! - `"PACK"`, 2 bytes version (`01 01`), `u32` directory size in bytes;
 //! - directory: entries of 136 bytes = 128-byte NUL-padded path, `u32` absolute
 //!   offset, `u32` size;
-//! - file data, each byte nibble-swapped (`0x42` is stored for `0x24`).
+//! - file data. Scripts, i.e. paths containing `.txt` (the engine's
+//!   `strstr(path, ".txt")` test), have each byte nibble-swapped (`0x42` is
+//!   stored for `0x24`); everything else (images, sounds, models) is raw.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -70,14 +72,16 @@ impl Pak {
         self.entries.iter().find(|e| e.path.eq_ignore_ascii_case(path))
     }
 
-    /// Reads and de-obfuscates one file.
+    /// Reads one file, decoding scripts like the engine does.
     pub fn read(&self, entry: &Entry) -> io::Result<Vec<u8>> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(entry.offset.into()))?;
         let mut data = vec![0u8; entry.size as usize];
         file.read_exact(&mut data)?;
-        for b in &mut data {
-            *b = b.rotate_left(4);
+        if entry.path.contains(".txt") {
+            for b in &mut data {
+                *b = b.rotate_left(4);
+            }
         }
         Ok(data)
     }

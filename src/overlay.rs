@@ -2,17 +2,34 @@
 //!
 //! Every build loads `*.pak` from its *working directory* (`EnumDirFiles("",
 //! "pak")`) and resolves loose data files relative to it too. An overlay is a
-//! temporary directory holding a symlink to every entry of the game folder plus
-//! a symlink to each extra pak; the game is started with it as working
-//! directory. Writes the game makes to existing files (config, log, saves
-//! folder, ...) go through the symlinks as usual; top-level files it creates are
-//! moved into the game folder when the overlay is closed, exactly where a normal
-//! run would have put them.
+//! temporary directory the game is started in, made of symlinks:
+//!
+//! - every entry of the game folder;
+//! - each extra (level) pak, and its whole content extracted as loose files, so
+//!   the level loads the same way whatever the build does with paks;
+//! - with `merge_textures` (the OpenGL port), the `textures/` of the game's own
+//!   paks: that build loads textures only as loose files (`GLTexture::Load` →
+//!   DevIL `ilLoadImage(path)`), never from paks, although its `data.pak` holds
+//!   them all.
+//!
+//! Where these overlap, level files win over the game paks' textures, which win
+//! over the game folder's own files. Folders that nothing overrides stay single
+//! symlinks; the others are rebuilt file by file. Extracted files are cached in
+//! `$TMPDIR/azl-pak-cache/` while the pak is unchanged.
+//!
+//! Writes the game makes to existing files (config, log, saves folder, ...) go
+//! through the symlinks as usual; top-level files it creates are moved into the
+//! game folder when the overlay is closed, where a normal run would have put them.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use crate::pak::Pak;
+
+const TEXTURES: &str = "textures";
 
 #[derive(Debug)]
 pub struct Overlay {
@@ -21,22 +38,71 @@ pub struct Overlay {
     linked: HashSet<PathBuf>,
 }
 
+/// Which files of a pak to extract.
+#[derive(Debug, Clone, Copy, Hash)]
+enum Extract {
+    All,
+    Textures,
+}
+
 impl Overlay {
-    pub fn create(game_dir: &Path, extra_paks: &[PathBuf]) -> io::Result<Self> {
-        let dir = std::env::temp_dir().join(format!("azl-overlay-{}", std::process::id()));
+    pub fn create(game_dir: &Path, extra_paks: &[PathBuf], merge_textures: bool) -> io::Result<Self> {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("azl-overlay-{}-{n}", std::process::id()));
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
         fs::create_dir_all(&dir)?;
         let mut overlay = Overlay { dir, game_dir: game_dir.to_owned(), linked: HashSet::new() };
 
+        // Lower-case relative path → file, lowest priority first.
+        let mut extracted = BTreeMap::new();
+        if merge_textures {
+            let mut paks: Vec<PathBuf> = fs::read_dir(game_dir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pak")))
+                .collect();
+            paks.sort();
+            for pak in &paks {
+                if let Ok(cache) = extracted_files(pak, Extract::Textures) {
+                    collect_files(&cache, Path::new(""), &mut extracted);
+                }
+            }
+        }
+        for pak in extra_paks {
+            // Not every extra pak has to be readable (or a pak at all).
+            if let Ok(cache) = extracted_files(pak, Extract::All) {
+                collect_files(&cache, Path::new(""), &mut extracted);
+            }
+        }
+        let merged_tops: HashSet<String> = extracted
+            .keys()
+            .filter_map(|p: &PathBuf| p.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()))
+            .collect();
+
+        // Game folder: whole entries, or their files where something overrides them.
+        let mut files = BTreeMap::new();
         let mut taken = HashSet::new();
         for entry in fs::read_dir(game_dir)? {
             let entry = entry?;
-            let name = entry.file_name();
-            taken.insert(name.to_string_lossy().to_lowercase());
-            overlay.link(&entry.path(), &name.to_string_lossy())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let lower = name.to_lowercase();
+            taken.insert(lower.clone());
+            if !merged_tops.contains(&lower) {
+                overlay.link(&entry.path(), &name)?;
+            } else if entry.path().is_dir() {
+                collect_files(&entry.path(), Path::new(&lower), &mut files);
+            }
         }
+        files.extend(extracted);
+        for (rel, source) in files {
+            // Lower-case names: Wine looks files up case-insensitively anyway.
+            let link = overlay.dir.join(&rel);
+            fs::create_dir_all(link.parent().unwrap())?;
+            symlink(&source, &link)?;
+        }
+
         for pak in extra_paks {
             let pak = pak.canonicalize()?;
             let name = pak.file_name().unwrap().to_string_lossy().into_owned();
@@ -59,7 +125,7 @@ impl Overlay {
     pub fn close(self) -> io::Result<()> {
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
-            if self.linked.contains(&path) || !path.is_file() {
+            if self.linked.contains(&path) || path.is_symlink() || !path.is_file() {
                 continue;
             }
             let target = self.game_dir.join(path.file_name().unwrap());
@@ -77,6 +143,56 @@ impl Overlay {
         self.linked.insert(link);
         Ok(())
     }
+}
+
+fn collect_files(dir: &Path, rel: &Path, out: &mut BTreeMap<PathBuf, PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name == ".complete" && rel.as_os_str().is_empty() {
+            continue;
+        }
+        let rel = rel.join(name);
+        if path.is_dir() {
+            collect_files(&path, &rel, out);
+        } else if path.is_file() {
+            out.insert(rel, path);
+        }
+    }
+}
+
+/// Extracts (part of) a pak into `$TMPDIR/azl-pak-cache/<key>/`, reused while
+/// the pak is unchanged (same path, size and modification time).
+fn extracted_files(pak: &Path, what: Extract) -> io::Result<PathBuf> {
+    let pak = pak.canonicalize()?;
+    let meta = fs::metadata(&pak)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (3u8, what, &pak, meta.len(), meta.modified().ok()).hash(&mut hasher);
+    let dir = std::env::temp_dir().join("azl-pak-cache").join(format!("{:016x}", hasher.finish()));
+    let done = dir.join(".complete");
+    if done.exists() {
+        return Ok(dir);
+    }
+    let _ = fs::remove_dir_all(&dir);
+    let archive = Pak::open(&pak)?;
+    for entry in archive.entries() {
+        let rel = Path::new(&entry.path);
+        let wanted = match what {
+            Extract::All => true,
+            Extract::Textures => rel.components().next().is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(TEXTURES)),
+        };
+        let safe = rel.components().all(|c| matches!(c, Component::Normal(_)));
+        if !wanted || !safe || entry.path.ends_with('/') {
+            continue;
+        }
+        let target = dir.join(rel);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::write(target, archive.read(entry)?)?;
+    }
+    fs::create_dir_all(&dir)?;
+    fs::write(done, b"")?;
+    Ok(dir)
 }
 
 #[cfg(unix)]
@@ -110,7 +226,7 @@ mod tests {
         fs::write(mods.join("data.pak"), b"mod").unwrap();
         fs::write(mods.join("lebel.pak"), b"lebel").unwrap();
 
-        let overlay = Overlay::create(&game, &[mods.join("lebel.pak"), mods.join("data.pak")]).unwrap();
+        let overlay = Overlay::create(&game, &[mods.join("lebel.pak"), mods.join("data.pak")], false).unwrap();
         let dir = overlay.dir().to_owned();
         assert_eq!(fs::read(dir.join("data.pak")).unwrap(), b"orig");
         assert_eq!(fs::read(dir.join("lebel.pak")).unwrap(), b"lebel");
@@ -123,6 +239,65 @@ mod tests {
         assert_eq!(fs::read(game.join("Azangara.log")).unwrap(), b"log");
         assert_eq!(fs::read(mods.join("lebel.pak")).unwrap(), b"lebel");
         assert!(!game.join("lebel.pak").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `.pak` with the given files (nibble-swapped data, 136-byte entries).
+    fn write_pak(path: &Path, files: &[(&str, &[u8])]) {
+        let dir_len = files.len() * 136;
+        let mut out = b"PACK\x01\x01".to_vec();
+        out.extend((dir_len as u32).to_le_bytes());
+        let mut offset = 10 + dir_len;
+        for (name, data) in files {
+            let mut entry = [0u8; 136];
+            entry[..name.len()].copy_from_slice(name.as_bytes());
+            entry[128..132].copy_from_slice(&(offset as u32).to_le_bytes());
+            entry[132..136].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend(entry);
+            offset += data.len();
+        }
+        for (name, data) in files {
+            let swap = name.contains(".txt");
+            out.extend(data.iter().map(|b| if swap { b.rotate_left(4) } else { *b }));
+        }
+        fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn merges_pak_and_loose_textures() {
+        let root = std::env::temp_dir().join(format!("azl-overlay-tex-test-{}", std::process::id()));
+        let game = root.join("game");
+        fs::create_dir_all(game.join("Textures/menu")).unwrap();
+        fs::write(game.join("Textures/menu/a.tga"), b"loose").unwrap();
+        fs::write(game.join("Textures/only_loose.tga"), b"loose only").unwrap();
+        write_pak(&game.join("data.pak"), &[("textures/menu/a.tga", b"pak a"), ("textures/b.jpg", b"pak b"), ("scripts/x.txt", b"x")]);
+        fs::create_dir_all(game.join("levels")).unwrap();
+        fs::write(game.join("levels/level_1.txt"), b"stock").unwrap();
+        let level = root.join("level.pak");
+        write_pak(&level, &[
+            ("textures/custom/c.png", b"level c"),
+            ("assets/indigo/indigo.txt", b"$header"),
+            ("assets/indigo/wall.tga", b"tga"),
+            ("levels/extra.txt", b"extra"),
+        ]);
+
+        let overlay = Overlay::create(&game, &[level], true).unwrap();
+        let t = overlay.dir().join("textures");
+        assert_eq!(fs::read(t.join("menu/a.tga")).unwrap(), b"pak a");
+        assert_eq!(fs::read(t.join("only_loose.tga")).unwrap(), b"loose only");
+        assert_eq!(fs::read(t.join("b.jpg")).unwrap(), b"pak b");
+        assert_eq!(fs::read(t.join("custom/c.png")).unwrap(), b"level c");
+        assert!(!t.join("x.txt").exists() && !overlay.dir().join("Textures").exists());
+        // The whole level pak is extracted, scripts decoded.
+        let d = overlay.dir();
+        assert_eq!(fs::read(d.join("assets/indigo/indigo.txt")).unwrap(), b"$header");
+        assert_eq!(fs::read(d.join("assets/indigo/wall.tga")).unwrap(), b"tga");
+        // A game folder the level also uses is merged file by file.
+        assert_eq!(fs::read(d.join("levels/level_1.txt")).unwrap(), b"stock");
+        assert_eq!(fs::read(d.join("levels/extra.txt")).unwrap(), b"extra");
+        assert!(d.join("level.pak").exists() && d.join("data.pak").is_symlink());
+        overlay.close().unwrap();
+        assert_eq!(fs::read(game.join("Textures/menu/a.tga")).unwrap(), b"loose");
         fs::remove_dir_all(root).unwrap();
     }
 }
