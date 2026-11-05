@@ -287,7 +287,16 @@ mod tests {
         assert_eq!(fs::read(t.join("only_loose.tga")).unwrap(), b"loose only");
         assert_eq!(fs::read(t.join("b.jpg")).unwrap(), b"pak b");
         assert_eq!(fs::read(t.join("custom/c.png")).unwrap(), b"level c");
-        assert!(!t.join("x.txt").exists() && !overlay.dir().join("Textures").exists());
+        assert!(!t.join("x.txt").exists() && !t.is_symlink());
+        let has_uppercase = fs::read_dir(overlay.dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name() == "Textures");
+        assert!(!has_uppercase);
+        // On case-sensitive filesystems (Linux), verify the uppercase directory does not exist.
+        // On Windows and macOS, path lookups are case-insensitive so "Textures" resolves to "textures".
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert!(!overlay.dir().join("Textures").exists());
         // The whole level pak is extracted, scripts decoded.
         let d = overlay.dir();
         assert_eq!(fs::read(d.join("assets/indigo/indigo.txt")).unwrap(), b"$header");
