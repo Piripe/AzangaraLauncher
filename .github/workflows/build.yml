@@ -1,0 +1,132 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+            rust_targets: i686-pc-windows-gnu
+          - os: windows-latest
+            platform: windows
+            arch: x86_64
+            rust_targets: i686-pc-windows-gnu
+          - os: macos-latest
+            platform: macos
+            arch: universal
+            rust_targets: aarch64-apple-darwin, x86_64-apple-darwin, i686-pc-windows-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev \
+            llvm \
+            binutils-mingw-w64-i686
+
+      - name: Configure environment (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          if [ -d 'C:/Program Files/LLVM/bin' ]; then
+            echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+            echo 'AZL_DLLTOOL=C:\Program Files\LLVM\bin\llvm-dlltool.exe' >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure environment (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          if ! command -v llvm-dlltool &> /dev/null; then
+            LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || echo "/opt/homebrew/opt/llvm")
+            if [ -d "$LLVM_PREFIX/bin" ]; then
+              echo "$LLVM_PREFIX/bin" >> $GITHUB_PATH
+              echo "AZL_DLLTOOL=$LLVM_PREFIX/bin/llvm-dlltool" >> $GITHUB_ENV
+            else
+              HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm || true
+              LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || echo "/opt/homebrew/opt/llvm")
+              if [ -d "$LLVM_PREFIX/bin" ]; then
+                echo "$LLVM_PREFIX/bin" >> $GITHUB_PATH
+                echo "AZL_DLLTOOL=$LLVM_PREFIX/bin/llvm-dlltool" >> $GITHUB_ENV
+              fi
+            fi
+          fi
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "macos" ]; then
+            cargo test --target aarch64-apple-darwin
+          else
+            cargo test
+          fi
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "macos" ]; then
+            cargo build --release --locked --target aarch64-apple-darwin --bin azangara-launcher
+            cargo build --release --locked --target x86_64-apple-darwin --bin azangara-launcher
+            mkdir -p target/release
+            lipo -create -output target/release/azangara-launcher \
+              target/aarch64-apple-darwin/release/azangara-launcher \
+              target/x86_64-apple-darwin/release/azangara-launcher
+          else
+            cargo build --release --locked --bin azangara-launcher
+          fi
+
+      - name: Stage binaries for artifact upload
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            cp target/release/azangara-launcher.exe dist/
+          else
+            cp target/release/azangara-launcher dist/
+            chmod +x dist/azangara-launcher
+          fi
+          cp README.md dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: azangara-launcher-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error

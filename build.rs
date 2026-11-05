@@ -77,7 +77,12 @@ fn find_dlltool() -> Option<PathBuf> {
         return Some(p.into());
     }
     let path = env::var_os("PATH")?;
-    let names = ["llvm-dlltool", "i686-w64-mingw32-dlltool"];
+    let names = [
+        "llvm-dlltool",
+        "i686-w64-mingw32-dlltool",
+        "llvm-dlltool.exe",
+        "i686-w64-mingw32-dlltool.exe",
+    ];
     env::split_paths(&path).find_map(|dir| {
         names.iter().map(|n| dir.join(n)).find(|p| p.is_file()).or_else(|| {
             // Versioned LLVM installs, e.g. llvm-dlltool-18.

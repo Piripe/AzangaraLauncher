@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]+.[0-9]+.[0-9]+*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag or release version to build (defaults to current ref)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+            rust_targets: i686-pc-windows-gnu
+          - os: windows-latest
+            platform: windows
+            arch: x86_64
+            rust_targets: i686-pc-windows-gnu
+          - os: macos-latest
+            platform: macos
+            arch: universal
+            rust_targets: aarch64-apple-darwin, x86_64-apple-darwin, i686-pc-windows-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.event.release.tag_name || github.ref }}
+
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev \
+            llvm \
+            binutils-mingw-w64-i686
+
+      - name: Configure environment (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          if [ -d 'C:/Program Files/LLVM/bin' ]; then
+            echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+            echo 'AZL_DLLTOOL=C:\Program Files\LLVM\bin\llvm-dlltool.exe' >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure environment (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          if ! command -v llvm-dlltool &> /dev/null; then
+            LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || echo "/opt/homebrew/opt/llvm")
+            if [ -d "$LLVM_PREFIX/bin" ]; then
+              echo "$LLVM_PREFIX/bin" >> $GITHUB_PATH
+              echo "AZL_DLLTOOL=$LLVM_PREFIX/bin/llvm-dlltool" >> $GITHUB_ENV
+            else
+              HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm || true
+              LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || echo "/opt/homebrew/opt/llvm")
+              if [ -d "$LLVM_PREFIX/bin" ]; then
+                echo "$LLVM_PREFIX/bin" >> $GITHUB_PATH
+                echo "AZL_DLLTOOL=$LLVM_PREFIX/bin/llvm-dlltool" >> $GITHUB_ENV
+              fi
+            fi
+          fi
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "macos" ]; then
+            cargo test --target aarch64-apple-darwin
+          else
+            cargo test
+          fi
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "macos" ]; then
+            cargo build --release --locked --target aarch64-apple-darwin --bin azangara-launcher
+            cargo build --release --locked --target x86_64-apple-darwin --bin azangara-launcher
+            mkdir -p target/release
+            lipo -create -output target/release/azangara-launcher \
+              target/aarch64-apple-darwin/release/azangara-launcher \
+              target/x86_64-apple-darwin/release/azangara-launcher
+          else
+            cargo build --release --locked --bin azangara-launcher
+          fi
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          RAW_TAG="${{ inputs.tag_name || github.event.release.tag_name || github.ref_name }}"
+          TAG="${RAW_TAG#refs/tags/}"
+          
+          mkdir -p release-packages
+          FOLDER="azangara-launcher-${TAG}-${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$FOLDER"
+          
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            cp target/release/azangara-launcher.exe "$FOLDER/"
+            cp README.md "$FOLDER/"
+            7z a "release-packages/${FOLDER}.zip" "$FOLDER"
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            cp target/release/azangara-launcher "$FOLDER/"
+            cp README.md "$FOLDER/"
+            chmod +x "$FOLDER/azangara-launcher"
+            tar -czf "release-packages/${FOLDER}.tar.gz" "$FOLDER"
+            zip -r "release-packages/${FOLDER}.zip" "$FOLDER"
+          else
+            cp target/release/azangara-launcher "$FOLDER/"
+            cp README.md "$FOLDER/"
+            chmod +x "$FOLDER/azangara-launcher"
+            tar -czf "release-packages/${FOLDER}.tar.gz" "$FOLDER"
+          fi
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-packages/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.event.release.tag_name || github.ref }}
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.event.release.tag_name || github.ref_name }}
+          name: Release ${{ inputs.tag_name || github.event.release.tag_name || github.ref_name }}
+          files: release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
