@@ -132,17 +132,13 @@ jobs:
           
           if [ "${{ matrix.platform }}" = "windows" ]; then
             cp target/release/azangara-launcher.exe "$FOLDER/"
-            cp README.md "$FOLDER/"
             7z a "release-packages/${FOLDER}.zip" "$FOLDER"
           elif [ "${{ matrix.platform }}" = "macos" ]; then
             cp target/release/azangara-launcher "$FOLDER/"
-            cp README.md "$FOLDER/"
             chmod +x "$FOLDER/azangara-launcher"
-            tar -czf "release-packages/${FOLDER}.tar.gz" "$FOLDER"
             zip -r "release-packages/${FOLDER}.zip" "$FOLDER"
           else
             cp target/release/azangara-launcher "$FOLDER/"
-            cp README.md "$FOLDER/"
             chmod +x "$FOLDER/azangara-launcher"
             tar -czf "release-packages/${FOLDER}.tar.gz" "$FOLDER"
           fi

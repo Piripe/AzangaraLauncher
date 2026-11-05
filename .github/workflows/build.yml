@@ -122,7 +122,6 @@ jobs:
             cp target/release/azangara-launcher dist/
             chmod +x dist/azangara-launcher
           fi
-          cp README.md dist/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
